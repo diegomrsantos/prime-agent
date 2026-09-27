@@ -113,6 +113,8 @@ function resolveAutonomousLimit(value: AutonomousLimitSetting | undefined): numb
 
 export type MermaidRenderingMode = "off" | "final" | "streaming";
 
+export type ChatDetail = "overview" | "details" | "all";
+
 export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
 	mermaid?: MermaidRenderingMode; // default: "streaming"
@@ -199,10 +201,13 @@ export interface Settings {
 	subagentDefaultModel?: string; // "provider/id" for rlm.spawn without a pinned model; unset inherits the parent model
 	updateChannel?: "stable" | "nightly"; // release channel for self-updates; unset follows the running version
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
-	// "provider/id" for background LLM passes (refinement review and planning);
-	// unset falls back to the session model. Routing these to a different model
-	// keeps their different prompt prefixes from evicting the session's provider
-	// prefix-cache entry.
+	// "provider/id" for background LLM passes (refinement review and planning,
+	// compaction summaries, branch summaries); unset falls back to the session
+	// model. These passes use their own prompt prefixes, so they can never hit
+	// the session's cached prefix: on the session model they re-read their whole
+	// input at peak price, and on OpenAI-style providers a divergent prefix
+	// riding the session's prompt_cache_key depresses hit rates. Routing them
+	// to a different model moves those calls off the session model.
 	auxiliaryModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
@@ -250,6 +255,7 @@ export interface Settings {
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default: "user-only"
+	chatDetail?: ChatDetail; // Default: "details"
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
@@ -825,9 +831,14 @@ export class SettingsManager {
 		this.save();
 	}
 
+	/**
+	 * "provider/id" of the model that runs background LLM passes (refinement
+	 * review and planning, compaction summaries, branch summaries). Falls back to
+	 * the session model when unset, equal to the session model, or unusable.
+	 */
 	getAuxiliaryModel(): string | undefined {
 		// Hand-edited or corrupt settings files can persist non-string values; treat
-		// anything malformed as unset so refinement falls back to the session model.
+		// anything malformed as unset so the pass falls back to the session model.
 		const value = this.settings.auxiliaryModel;
 		return typeof value === "string" ? value : undefined;
 	}
@@ -1477,6 +1488,17 @@ export class SettingsManager {
 		this.globalSettings.markdown ??= {};
 		this.globalSettings.markdown.mermaid = mode;
 		this.markModified("markdown", "mermaid");
+		this.save();
+	}
+
+	getChatDetail(): ChatDetail {
+		const detail = this.settings.chatDetail;
+		return detail === "overview" || detail === "all" ? detail : "details";
+	}
+
+	setChatDetail(detail: ChatDetail): void {
+		this.globalSettings.chatDetail = detail;
+		this.markModified("chatDetail");
 		this.save();
 	}
 
