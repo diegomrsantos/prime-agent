@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@earendil-works/pi-ai";
 import { getApiProvider, registerFauxProvider, unregisterApiProviders } from "@earendil-works/pi-ai";
@@ -73,6 +73,7 @@ export interface HarnessOptions {
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
 	tools?: AgentTool[];
+	streamFn?: StreamFn;
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
@@ -162,6 +163,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	}
 
 	const agent = new Agent({
+		streamFn: options.streamFn,
+		sessionId: sessionManager.getSessionId(),
 		getApiKey: () => (withConfiguredAuth ? "faux-key" : undefined),
 		initialState: {
 			model,

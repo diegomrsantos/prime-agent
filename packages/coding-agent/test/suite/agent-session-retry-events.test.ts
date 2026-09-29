@@ -11,6 +11,10 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	closeOpenAICodexWebSocketSessions,
+	streamOpenAICodexResponses,
+} from "../../../ai/src/providers/openai-codex-responses.js";
 import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
@@ -73,6 +77,293 @@ type SessionRetryCompactionInternals = {
 	_cancelPostCompactionContinue: () => void;
 };
 
+function waitFor(harness: Harness, ready: () => boolean): Promise<void> {
+	return new Promise((resolve) => {
+		const unsubscribe = harness.session.subscribe(() => {
+			if (ready()) {
+				unsubscribe();
+				resolve();
+			}
+		});
+		if (ready()) {
+			unsubscribe();
+			resolve();
+		}
+	});
+}
+
+describe("#1232 Codex stalled thinking through AgentSession", () => {
+	const inactivityMs = 300_000;
+	type WireEvent = Record<string, unknown>;
+	type Request = {
+		body: Record<string, unknown>;
+		transport: string;
+		emit: (event: WireEvent) => void;
+		closed: boolean;
+	};
+	function mockTransport(): Request[] {
+		const requests: Request[] = [];
+		const start = (body: string, transport: string, emit: Request["emit"]): Request => {
+			const request = { body: JSON.parse(body), transport, emit, closed: false };
+			requests.push(request);
+			emit({ type: "response.created", response: { id: `response-${requests.length}` } });
+			emit({
+				type: "response.output_item.added",
+				item: { type: "reasoning", id: `reasoning-${requests.length}`, summary: [] },
+			});
+			emit({ type: "response.reasoning_summary_part.added", part: { type: "summary_text", text: "" } });
+			emit({ type: "response.reasoning_summary_text.delta", delta: "unfinished thinking" });
+			return request;
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_url: string, init: RequestInit) => {
+				let request: Request;
+				const body = new ReadableStream<Uint8Array>({
+					start(controller) {
+						request = start(String(init.body), "sse", (event) =>
+							controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`)),
+						);
+					},
+					cancel() {
+						request.closed = true;
+					},
+				});
+				return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+			}),
+		);
+		vi.stubGlobal(
+			"WebSocket",
+			class extends EventTarget {
+				readyState = 0;
+				request?: Request;
+				constructor() {
+					super();
+					queueMicrotask(() => {
+						this.readyState = 1;
+						this.dispatchEvent(new Event("open"));
+					});
+				}
+				send(body: string) {
+					queueMicrotask(() => {
+						this.request = start(body, "websocket", (event) =>
+							this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) })),
+						);
+					});
+				}
+				close() {
+					this.readyState = 3;
+					if (this.request) this.request.closed = true;
+					this.dispatchEvent(new Event("close"));
+				}
+			},
+		);
+		return requests;
+	}
+	function finish(request: Request, tool = false): void {
+		const item = tool
+			? { type: "function_call", id: "fc_echo", call_id: "call_echo", name: "echo", arguments: "{}" }
+			: {
+					type: "message",
+					id: "msg_recovered",
+					role: "assistant",
+					content: [{ type: "output_text", text: "recovered" }],
+				};
+		request.emit({ type: "response.output_item.added", item });
+		request.emit({ type: "response.output_item.done", item });
+		request.emit({
+			type: "response.completed",
+			response: {
+				id: "response-completed",
+				status: "completed",
+				usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+			},
+		});
+	}
+	function thinkingCount(harness: Harness): number {
+		return harness
+			.eventsOfType("message_update")
+			.filter((event) => event.assistantMessageEvent.type === "thinking_delta").length;
+	}
+
+	it.each(
+		(["sse", "auto"] as const).flatMap((transport) =>
+			[
+				{ scenario: "recovery", stalls: 1 },
+				{ scenario: "repeated recovery", stalls: 3 },
+				{ scenario: "tool continuation", stalls: 1 },
+				{ scenario: "retry exhaustion", stalls: 3 },
+				{ scenario: "extended attempt bound", stalls: 5 },
+				{ scenario: "extended time bound", stalls: 4 },
+				{ scenario: "retry disabled", stalls: 1 },
+				{ scenario: "cancel during backoff", stalls: 1 },
+				{ scenario: "cancel during thinking", stalls: 0 },
+				{ scenario: "cancel during retry thinking", stalls: 1 },
+				{ scenario: "progress beyond deadline", stalls: 0 },
+			].map((test) => ({ ...test, transport })),
+		),
+	)("$transport: $scenario", async ({ transport, scenario, stalls }) => {
+		vi.useFakeTimers();
+		const requests = mockTransport();
+		let harness: Harness | undefined;
+		let running: Promise<void> | undefined;
+		let toolRuns = 0;
+		try {
+			const extended = scenario.startsWith("extended");
+			harness = await createHarness({
+				persistSession: true,
+				settings: {
+					retry: {
+						enabled: scenario !== "retry disabled",
+						maxRetries: scenario === "repeated recovery" ? 3 : 2,
+						baseDelayMs: 100,
+						provider: {
+							waitForUsage: {
+								enabled: extended,
+								baseDelayMs: 100,
+								maxDelayMs: 100,
+								maxAttempts: 2,
+								maxWaitMs: scenario === "extended time bound" ? inactivityMs : 900_000,
+							},
+						},
+					},
+				},
+				// Keep the real provider stream visible to AgentSession and its semantic edge wrapper.
+				streamFn: (model, context, options) =>
+					streamOpenAICodexResponses({ ...model, api: "openai-codex-responses", compat: undefined }, context, {
+						...options,
+						transport,
+						apiKey: `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.test`,
+					}),
+				tools: [
+					{
+						name: "echo",
+						label: "Echo",
+						description: "Record execution",
+						parameters: Type.Object({}),
+						execute: async () => {
+							toolRuns++;
+							return { content: [{ type: "text", text: "tool result" }], details: {} };
+						},
+					},
+				],
+			});
+			const session = harness;
+			const failures = () =>
+				session
+					.eventsOfType("message_end")
+					.filter((event) => event.message.role === "assistant" && event.message.stopReason === "error");
+			running = session.session.prompt("complete the experiment");
+			await waitFor(session, () => thinkingCount(session) === 1);
+			expect(requests[0].transport).toBe(transport === "auto" ? "websocket" : "sse");
+			if (scenario === "cancel during thinking") {
+				await session.session.abort();
+			} else if (scenario === "progress beyond deadline") {
+				await vi.advanceTimersByTimeAsync(inactivityMs - 1);
+				requests[0].emit({ type: "response.reasoning_summary_text.delta", delta: "still progressing" });
+				await waitFor(session, () => thinkingCount(session) === 2);
+				await vi.advanceTimersByTimeAsync(inactivityMs - 1);
+				expect(failures()).toHaveLength(0);
+				finish(requests[0]);
+			} else {
+				for (let attempt = 0; attempt < stalls; attempt++) {
+					await vi.advanceTimersByTimeAsync(inactivityMs - 1);
+					expect(failures()).toHaveLength(attempt);
+					await vi.advanceTimersByTimeAsync(1);
+					expect(failures()).toHaveLength(attempt + 1);
+					expect(failures().at(-1)?.message).toMatchObject({
+						errorMessage: expect.stringContaining("without a provider event"),
+						diagnostics: expect.arrayContaining([
+							expect.objectContaining({
+								type: "provider_stream_failure",
+								error: expect.objectContaining({ code: "ETIMEDOUT" }),
+							}),
+						]),
+					});
+					expect(requests[attempt].closed).toBe(true);
+					if (
+						attempt === stalls - 1 &&
+						(scenario.includes("bound") || scenario === "retry exhaustion" || scenario === "retry disabled")
+					)
+						break;
+					await waitFor(session, () => session.eventsOfType("auto_retry_start").length === attempt + 1);
+					if (scenario === "cancel during backoff") {
+						session.session.abortRetry();
+						break;
+					}
+					const retry = session.eventsOfType("auto_retry_start").at(-1)!;
+					await vi.advanceTimersByTimeAsync(retry.delayMs);
+					await vi.advanceTimersToNextTimerAsync();
+					await waitFor(session, () => thinkingCount(session) === attempt + 2);
+					expect(requests[attempt + 1].body.previous_response_id).toBeUndefined();
+					expect(JSON.stringify(requests[attempt + 1].body.input)).toContain("complete the experiment");
+					expect(JSON.stringify(requests[attempt + 1].body.input)).not.toContain("unfinished thinking");
+					expect(requests[attempt + 1].transport).toBe("sse");
+				}
+				if (scenario === "cancel during retry thinking") await session.session.abort();
+				if (scenario.endsWith("recovery") || scenario === "tool continuation") {
+					finish(requests.at(-1)!, scenario === "tool continuation");
+					if (scenario === "tool continuation") {
+						await waitFor(session, () => thinkingCount(session) === stalls + 2);
+						expect(JSON.stringify(requests.at(-1)!.body.input)).toContain("tool result");
+						finish(requests.at(-1)!);
+					}
+				}
+			}
+			if (scenario.includes("bound") || scenario === "retry exhaustion")
+				expect(session.eventsOfType("auto_retry_end")).toHaveLength(1);
+			await running;
+			expect(session.session.isRetrying).toBe(false);
+			expect(session.session.isStreaming).toBe(false);
+			expect(toolRuns).toBe(scenario === "tool continuation" ? 1 : 0);
+			const success =
+				scenario.endsWith("recovery") ||
+				scenario === "tool continuation" ||
+				scenario === "progress beyond deadline";
+			expect(getAssistantTexts(session).filter((text) => text === "recovered")).toHaveLength(Number(success));
+			const persisted = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message" && entry.message.role === "assistant");
+			expect(
+				persisted.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error",
+				),
+			).toHaveLength(stalls);
+			const retryEnds = session.eventsOfType("auto_retry_end");
+			expect(retryEnds.map((event) => event.success)).toEqual(
+				stalls && scenario !== "retry disabled" ? [success] : [],
+			);
+			if (extended) {
+				expect(session.eventsOfType("auto_retry_start").map((event) => event.reason)).toEqual([
+					undefined,
+					undefined,
+					...Array.from({ length: stalls - 3 }, () => "unavailable"),
+				]);
+				expect(retryEnds[0].finalError).toContain(scenario === "extended time bound" ? "maxWaitMs" : "maxAttempts");
+			}
+			if (scenario === "cancel during backoff" || scenario === "cancel during retry thinking")
+				expect(retryEnds[0].finalError).toBe("Retry cancelled");
+			if (scenario.includes("thinking")) {
+				expect(session.session.messages.at(-1)).toMatchObject({ stopReason: "aborted" });
+				expect(requests.at(-1)?.closed).toBe(true);
+			}
+			const count = requests.length;
+			await vi.advanceTimersByTimeAsync(inactivityMs * 2);
+			expect(requests).toHaveLength(count);
+		} finally {
+			await harness?.session.abort();
+			await running;
+			harness?.cleanup();
+			closeOpenAICodexWebSocketSessions();
+			vi.unstubAllGlobals();
+			vi.useRealTimers();
+		}
+	});
+});
+
 describe("AgentSession retry and event characterization", () => {
 	const harnesses: Harness[] = [];
 
@@ -82,26 +373,31 @@ describe("AgentSession retry and event characterization", () => {
 		}
 	});
 
-	it("retries after a transient error and succeeds", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
-		harnesses.push(harness);
-		const retryEvents: string[] = [];
-		harness.session.subscribe((event) => {
-			if (event.type === "auto_retry_start") retryEvents.push(`start:${event.attempt}`);
-			if (event.type === "auto_retry_end") retryEvents.push(`end:${event.success}`);
-		});
-
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("recovered"),
-		]);
-
-		await harness.session.prompt("test");
-
-		expect(retryEvents).toEqual(["start:1", "end:true"]);
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(harness.session.isRetrying).toBe(false);
-	});
+	it.each([
+		{ failures: 1, maxRetries: 3, enabled: true, success: true },
+		{ failures: 2, maxRetries: 3, enabled: true, success: true },
+		{ failures: 3, maxRetries: 2, enabled: true, success: false },
+		{ failures: 1, maxRetries: 3, enabled: false, success: false },
+	])(
+		"handles $failures transient failures with retries enabled=$enabled and success=$success",
+		async ({ failures, maxRetries, enabled, success }) => {
+			const harness = await createHarness({ settings: { retry: { enabled, maxRetries, baseDelayMs: 1 } } });
+			harnesses.push(harness);
+			harness.setResponses([
+				...Array.from({ length: failures }, () =>
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+				),
+				...(success ? [fauxAssistantMessage("recovered")] : []),
+			]);
+			await harness.session.prompt("test");
+			expect(harness.faux.state.callCount).toBe(failures + Number(success));
+			expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual(
+				Array.from({ length: enabled ? failures - Number(!success) : 0 }, (_, index) => index + 1),
+			);
+			expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual(enabled ? [success] : []);
+			expect(harness.session.isRetrying).toBe(false);
+		},
+	);
 
 	it("ends the retry when the scheduled continue cannot run", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
@@ -163,49 +459,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect(retryEvents).toEqual(["start:1", "end:false:Retry cancelled", "start:1", "end:false:Nothing to continue"]);
 	});
 
-	it("retries multiple transient failures and succeeds on the final attempt", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
-		harnesses.push(harness);
-		const retryEvents: string[] = [];
-		harness.session.subscribe((event) => {
-			if (event.type === "auto_retry_start") retryEvents.push(`start:${event.attempt}`);
-			if (event.type === "auto_retry_end") retryEvents.push(`end:${event.success}`);
-		});
-
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("success"),
-		]);
-
-		await harness.session.prompt("test");
-
-		expect(retryEvents).toEqual(["start:1", "start:2", "end:true"]);
-		expect(harness.faux.state.callCount).toBe(3);
-	});
-
-	it("exhausts max retries and emits a failure event", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } } });
-		harnesses.push(harness);
-		const retryEvents: string[] = [];
-		harness.session.subscribe((event) => {
-			if (event.type === "auto_retry_start") retryEvents.push(`start:${event.attempt}`);
-			if (event.type === "auto_retry_end") retryEvents.push(`end:${event.success}`);
-		});
-
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
-		]);
-
-		await harness.session.prompt("test");
-
-		expect(retryEvents).toEqual(["start:1", "start:2", "end:false"]);
-		expect(harness.faux.state.callCount).toBe(3);
-		expect(harness.session.isRetrying).toBe(false);
-	});
-
 	it("prompt waits for retry completion even when assistant message_end handling is delayed", async () => {
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
@@ -258,17 +511,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.queuedActionCount).toBe(1);
 	});
 
-	it("does not retry when retry is disabled", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: false } } });
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })]);
-
-		await harness.session.prompt("test");
-
-		expect(harness.faux.state.callCount).toBe(1);
-		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
-	});
-
 	it("does not retry faux provider queue exhaustion", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
@@ -306,38 +548,22 @@ describe("AgentSession retry and event characterization", () => {
 		}
 	});
 
-	for (const [name, errorMessage] of [
+	it.each([
+		["generic provider errors", "invalid_api_key"],
+		['#3317 transient "Network connection lost." failures', "Network connection lost."],
 		["network finish reason", "Provider finish_reason: network_error"],
 		["content-filter finish reason", "Provider finish_reason: content_filter"],
 		["empty response", "Provider returned an empty response"],
 		["cybersecurity policy flag", "Your request was flagged for cybersecurity risk and cannot be processed."],
 		["usage policy flag", "flagged as potentially violating our usage policy"],
 		["prose-form transient 5xx", "An error occurred while processing your request. You can retry your request."],
-	] as const) {
-		it(`retries ${name}`, async () => {
-			const harness = await createHarness({
-				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
-			});
-			harnesses.push(harness);
-			harness.setResponses([
-				fauxAssistantMessage("", { stopReason: "error", errorMessage }),
-				fauxAssistantMessage("recovered"),
-			]);
-
-			await harness.session.prompt("test");
-
-			expect(harness.faux.state.callCount).toBe(2);
-			expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
-			expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
-			expect(harness.session.isRetrying).toBe(false);
+	] as const)("retries %s", async (_name, errorMessage) => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
 		});
-	}
-
-	it("retries generic provider errors", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_api_key" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage }),
 			fauxAssistantMessage("recovered"),
 		]);
 
@@ -346,38 +572,36 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.faux.state.callCount).toBe(2);
 		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
-	});
-
-	it("retries structured provider auth failures once", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
-		harnesses.push(harness);
-		harness.setResponses([
-			structuredProviderFailure("auth"),
-			structuredProviderFailure("auth"),
-			fauxAssistantMessage("unused"),
-		]);
-
-		await harness.session.prompt("test");
-
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
-		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
 		expect(harness.session.isRetrying).toBe(false);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.errorMessage)).toEqual([
+			errorMessage === "invalid_api_key" ? expect.stringContaining(errorMessage) : errorMessage,
+		]);
+		expect(getAssistantTexts(harness)).toContain("recovered");
 	});
 
-	for (const kind of ["invalid_request", "refusal", "permission"] as const) {
-		it(`does not retry structured permanent provider ${kind} failures`, async () => {
+	it.each(["auth", "invalid_request", "refusal", "permission"] as const)(
+		"bounds retries for structured %s failures",
+		async (kind) => {
 			const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 			harnesses.push(harness);
-			harness.setResponses([structuredProviderFailure(kind), fauxAssistantMessage("unused")]);
+			const attempts = kind === "auth" ? 2 : 1;
+			harness.setResponses([
+				...Array.from({ length: attempts }, () => structuredProviderFailure(kind)),
+				fauxAssistantMessage("unused"),
+			]);
 
 			await harness.session.prompt("test");
 
-			expect(harness.faux.state.callCount).toBe(1);
-			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(attempts);
+			expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual(
+				kind === "auth" ? [1] : [],
+			);
+			expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual(
+				kind === "auth" ? [false] : [],
+			);
 			expect(harness.session.isRetrying).toBe(false);
-		});
-	}
+		},
+	);
 
 	it("waits at least the provider-requested Retry-After delay before retrying", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
@@ -504,9 +728,8 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.faux.state.callCount).toBe(1);
 	});
 
-	it("waits for the full loop when retry recovery produces tool calls", async () => {
-		const toolRuns: string[] = [];
-		const echoTool: AgentTool = {
+	function recordingEcho(toolRuns: string[]): AgentTool {
+		return {
 			name: "echo",
 			label: "Echo",
 			description: "Echo text back",
@@ -517,6 +740,11 @@ describe("AgentSession retry and event characterization", () => {
 				return { content: [{ type: "text", text: `echo:${text}` }], details: { text } };
 			},
 		};
+	}
+
+	it("waits for the full loop when retry recovery produces tool calls", async () => {
+		const toolRuns: string[] = [];
+		const echoTool = recordingEcho(toolRuns);
 		const harness = await createHarness({
 			tools: [echoTool],
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
@@ -579,51 +807,20 @@ describe("AgentSession retry and event characterization", () => {
 		]);
 	});
 
-	it("emits the expected event order for a single prompt", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("hello")]);
-
-		await harness.session.prompt("hi");
-
-		expect(normalizeEventOrder(harness.events)).toEqual([
-			"agent_start",
-			"turn_start",
-			"message_start:custom",
-			"message_end:custom",
-			"message_start:user",
-			"message_end:user",
-			"message_start:assistant",
-			"message_update",
-			"message_end:assistant",
-			"turn_end",
-			"agent_end",
-		]);
-	});
-
-	it("emits the expected event order for a tool call turn", async () => {
+	it.each([false, true])("emits the expected event order with a tool turn=%s", async (withTool) => {
 		const toolRuns: string[] = [];
-		const echoTool: AgentTool = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo text back",
-			parameters: Type.Object({ text: Type.String() }),
-			execute: async (_toolCallId, params) => {
-				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
-				toolRuns.push(text);
-				return { content: [{ type: "text", text: `echo:${text}` }], details: { text } };
-			},
-		};
-		const harness = await createHarness({ tools: [echoTool] });
+		const harness = await createHarness({ tools: withTool ? [recordingEcho(toolRuns)] : [] });
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
-			fauxAssistantMessage("done"),
+			...(withTool
+				? [fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" })]
+				: []),
+			fauxAssistantMessage(withTool ? "done" : "hello"),
 		]);
 
 		await harness.session.prompt("hi");
 
-		expect(toolRuns).toEqual(["hello"]);
+		expect(toolRuns).toEqual(withTool ? ["hello"] : []);
 		expect(normalizeEventOrder(harness.events)).toEqual([
 			"agent_start",
 			"turn_start",
@@ -634,15 +831,19 @@ describe("AgentSession retry and event characterization", () => {
 			"message_start:assistant",
 			"message_update",
 			"message_end:assistant",
-			"tool_execution_start:echo",
-			"tool_execution_end:echo",
-			"message_start:toolResult",
-			"message_end:toolResult",
-			"turn_end",
-			"turn_start",
-			"message_start:assistant",
-			"message_update",
-			"message_end:assistant",
+			...(withTool
+				? [
+						"tool_execution_start:echo",
+						"tool_execution_end:echo",
+						"message_start:toolResult",
+						"message_end:toolResult",
+						"turn_end",
+						"turn_start",
+						"message_start:assistant",
+						"message_update",
+						"message_end:assistant",
+					]
+				: []),
 			"turn_end",
 			"agent_end",
 		]);
@@ -758,59 +959,58 @@ describe("AgentSession retry and event characterization", () => {
 		};
 	}
 
-	it("waits for quota recovery with bounded pings and resumes automatically", async () => {
+	it.each([
+		{
+			scenario: "recovers after bounded pings",
+			failures: 2,
+			maxAttempts: 5,
+			maxDelayMs: 4,
+			retryAfterMs: undefined,
+			success: true,
+		},
+		{
+			scenario: "resumes at the provider reset",
+			failures: 1,
+			maxAttempts: 5,
+			maxDelayMs: 4,
+			retryAfterMs: 40,
+			success: true,
+		},
+		{
+			scenario: "stops at the ping bound",
+			failures: 3,
+			maxAttempts: 2,
+			maxDelayMs: 2,
+			retryAfterMs: undefined,
+			success: false,
+		},
+	])("quota wait $scenario", async ({ failures, maxAttempts, maxDelayMs, retryAfterMs, success }) => {
 		const harness = await createHarness({
-			settings: waitSettings({ baseDelayMs: 1, maxDelayMs: 4, maxAttempts: 5, maxWaitMs: 10_000 }),
+			settings: waitSettings({ baseDelayMs: 1, maxDelayMs, maxAttempts, maxWaitMs: 10_000 }),
 		});
 		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), quotaFailure(), fauxAssistantMessage("recovered")]);
-
-		await harness.session.prompt("test");
-
-		const starts = harness.eventsOfType("auto_retry_start");
-		expect(starts.map((event) => [event.reason, event.attempt, event.maxAttempts])).toEqual([
-			["usage", 1, 5],
-			["usage", 2, 5],
+		harness.setResponses([
+			...Array.from({ length: failures }, () => quotaFailure({ retryAfterMs })),
+			...(success ? [fauxAssistantMessage("recovered")] : []),
 		]);
-		expect(harness.faux.state.callCount).toBe(3);
-		expect(harness.eventsOfType("auto_retry_end")).toEqual([{ type: "auto_retry_end", success: true, attempt: 2 }]);
-		expect(harness.session.isRetrying).toBe(false);
-	});
-
-	it("resumes a quota wait at the provider-reported reset time", async () => {
-		const harness = await createHarness({
-			settings: waitSettings({ baseDelayMs: 1, maxDelayMs: 4, maxAttempts: 5, maxWaitMs: 10_000 }),
-		});
-		harnesses.push(harness);
-		harness.setResponses([quotaFailure({ retryAfterMs: 40 }), fauxAssistantMessage("recovered")]);
 
 		await harness.session.prompt("test");
 
 		const starts = harness.eventsOfType("auto_retry_start");
-		expect(starts.map((event) => [event.reason, event.delayMs])).toEqual([["usage", 40]]);
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
-	});
-
-	it("aborts the quota wait at the configured ping bound", async () => {
-		const harness = await createHarness({
-			settings: waitSettings({ baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 2, maxWaitMs: 10_000 }),
-		});
-		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), quotaFailure(), quotaFailure()]);
-
-		await harness.session.prompt("test");
-
-		const starts = harness.eventsOfType("auto_retry_start");
-		expect(starts.map((event) => [event.reason, event.attempt])).toEqual([
-			["usage", 1],
-			["usage", 2],
+		const retries = success ? failures : maxAttempts;
+		expect(starts.map((event) => [event.reason, event.attempt, event.maxAttempts])).toEqual(
+			Array.from({ length: retries }, (_, index) => ["usage", index + 1, maxAttempts]),
+		);
+		if (retryAfterMs !== undefined) expect(starts.map((event) => event.delayMs)).toEqual([retryAfterMs]);
+		expect(harness.faux.state.callCount).toBe(failures + Number(success));
+		expect(harness.eventsOfType("auto_retry_end")).toEqual([
+			{
+				type: "auto_retry_end",
+				success,
+				attempt: retries,
+				...(!success ? { finalError: expect.stringContaining("maxAttempts") } : {}),
+			},
 		]);
-		expect(harness.faux.state.callCount).toBe(3);
-		const retryEnd = harness.eventsOfType("auto_retry_end");
-		expect(retryEnd).toHaveLength(1);
-		expect(retryEnd[0]?.success).toBe(false);
-		expect(retryEnd[0]?.finalError).toContain("maxAttempts");
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
@@ -876,16 +1076,6 @@ describe("AgentSession retry and event characterization", () => {
 		return async () => buffered.shift() ?? (await new Promise<AssistantMessage>((resolve) => waiters.push(resolve)));
 	};
 
-	const waitFor = (harness: Harness, ready: () => boolean): Promise<void> =>
-		new Promise((resolve) => {
-			const settle = (): void => {
-				if (!ready()) return;
-				unsubscribe();
-				resolve();
-			};
-			const unsubscribe = harness.session.subscribe(settle);
-			settle();
-		});
 	const waitForRetryEnds = (harness: Harness, count: number): Promise<void> =>
 		waitFor(harness, () => harness.eventsOfType("auto_retry_end").length >= count);
 
@@ -1134,12 +1324,21 @@ describe("AgentSession retry and event characterization", () => {
 		expect([harness.session.isQuotaParked, harness.session.goalState.status]).toEqual([false, "complete"]);
 	});
 
-	it("does not park while a backup model is configured and available", async () => {
+	const backupHarness = async (settings: Partial<Settings> = {}): Promise<Harness> => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: { providerBackupModel: "faux/faux-backup", ...parkSettings({}) },
+			settings: {
+				providerBackupModel: "faux/faux-backup",
+				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+				...settings,
+			},
 		});
 		harnesses.push(harness);
+		return harness;
+	};
+
+	it("does not park while a backup model is configured and available", async () => {
+		const harness = await backupHarness(parkSettings({}));
 		harness.setResponses([quotaFailure({ retryAfterMs: 3_600_000 }), fauxAssistantMessage("backup answer")]);
 		await harness.session.prompt("do the work");
 		expect(harness.eventsOfType("auto_retry_start").map((event) => event.reason)).toEqual(["backup"]);
@@ -1177,96 +1376,44 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
 	});
 
-	it("routes quota-blocked turns to the configured backup model and returns to the primary", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), fauxAssistantMessage("backup answer")]);
-
-		await harness.session.prompt("test");
+	it.each([
+		{ scenario: "quota blocked", failure: quotaFailure, turns: 1 },
+		{ scenario: "consecutive quota blocked", failure: quotaFailure, turns: 2 },
+		{ scenario: "transiently unavailable", failure: transientUnavailableFailure, turns: 1 },
+	])("routes $scenario turns to the backup and restores the primary", async ({ failure, turns }) => {
+		const harness = await backupHarness();
+		const failed = failure();
+		for (let turn = 0; turn < turns; turn++) {
+			harness.appendResponses([failed, fauxAssistantMessage("backup answer")]);
+			await harness.session.prompt(`turn ${turn}`);
+			expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", model: "faux-backup" });
+			expect(harness.session.model?.id).toBe("faux-1");
+		}
 
 		const starts = harness.eventsOfType("auto_retry_start");
-		expect(starts).toEqual([
-			{
+		expect(starts).toEqual(
+			Array.from({ length: turns }, () => ({
 				type: "auto_retry_start",
 				attempt: 1,
 				maxAttempts: 3,
 				delayMs: 0,
-				errorMessage: "429 You have hit your ChatGPT usage limit",
+				errorMessage: failed.errorMessage,
 				reason: "backup",
 				backupModel: "faux/faux-backup",
-			},
-		]);
-		const lastAssistant = [...harness.session.messages].reverse().find((message) => message.role === "assistant");
-		expect(lastAssistant?.role).toBe("assistant");
-		if (lastAssistant?.role === "assistant") {
-			// The retry really ran on the backup model.
-			expect(lastAssistant.model).toBe("faux-backup");
-		}
-		expect(harness.eventsOfType("auto_retry_end")).toEqual([
-			{ type: "auto_retry_end", success: true, attempt: 1, restoredModel: "faux/faux-1" },
-		]);
-		// Auto-return: the session is back on the primary model.
-		expect(harness.session.model?.id).toBe("faux-1");
-	});
-
-	it("probes the primary again on the next turn after a backup success", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), fauxAssistantMessage("backup answer")]);
-		await harness.session.prompt("one");
-		harness.appendResponses([quotaFailure(), fauxAssistantMessage("backup answer two")]);
-		await harness.session.prompt("two");
-
-		const backupStarts = harness.eventsOfType("auto_retry_start").filter((event) => event.reason === "backup");
-		expect(backupStarts).toHaveLength(2);
-		const restoredEnds = harness
-			.eventsOfType("auto_retry_end")
-			.filter((event) => event.restoredModel === "faux/faux-1");
-		expect(restoredEnds).toHaveLength(2);
-		expect(harness.session.model?.id).toBe("faux-1");
-	});
-
-	it("routes transiently unavailable providers to the backup model", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
-		harness.setResponses([transientUnavailableFailure(), fauxAssistantMessage("backup answer")]);
-
-		await harness.session.prompt("test");
-
-		const starts = harness.eventsOfType("auto_retry_start");
-		expect(starts.map((event) => [event.reason, event.backupModel])).toEqual([["backup", "faux/faux-backup"]]);
-		expect(harness.eventsOfType("auto_retry_end").map((event) => [event.success, event.restoredModel])).toEqual([
-			[true, "faux/faux-1"],
-		]);
+			})),
+		);
+		expect(harness.eventsOfType("auto_retry_end")).toEqual(
+			Array.from({ length: turns }, () => ({
+				type: "auto_retry_end",
+				success: true,
+				attempt: 1,
+				restoredModel: "faux/faux-1",
+			})),
+		);
 	});
 
 	it("does not route permanent failures to the backup model", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
+		const harness = await backupHarness();
 		harness.setResponses([structuredProviderFailure("invalid_request"), fauxAssistantMessage("unused")]);
 
 		await harness.session.prompt("test");
@@ -1301,19 +1448,14 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("restores the primary model when a backup-model retry is cancelled mid-wait", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: {
-					enabled: true,
-					maxRetries: 3,
-					baseDelayMs: 1,
-					provider: { waitForUsage: { baseDelayMs: 200, maxDelayMs: 200, maxAttempts: 3, maxWaitMs: 10_000 } },
-				},
+		const harness = await backupHarness({
+			retry: {
+				enabled: true,
+				maxRetries: 3,
+				baseDelayMs: 1,
+				provider: { waitForUsage: { baseDelayMs: 200, maxDelayMs: 200, maxAttempts: 3, maxWaitMs: 10_000 } },
 			},
 		});
-		harnesses.push(harness);
 		harness.setResponses([quotaFailure(), quotaFailure()]);
 		const sawWaitStart = new Promise<void>((resolve) => {
 			const unsubscribe = harness.session.subscribe((event) => {
@@ -1338,64 +1480,43 @@ describe("AgentSession retry and event characterization", () => {
 		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
 	});
 
-	it("restores the primary model when quick retries exhaust on the backup model", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
+	it.each([
+		{ scenario: "quick retries", maxRetries: 2, waitEnabled: false, failures: 3 },
+		{ scenario: "bounded wait", maxRetries: 3, waitEnabled: true, failures: 4 },
+	])(
+		"restores the primary model when $scenario exhaust on the backup",
+		async ({ maxRetries, waitEnabled, failures }) => {
+			const waitForUsage = {
+				enabled: waitEnabled,
+				baseDelayMs: 1,
+				maxDelayMs: 2,
+				maxAttempts: 2,
+				maxWaitMs: 10_000,
+			};
+			const harness = await backupHarness({
 				retry: {
 					enabled: true,
-					maxRetries: 2,
+					maxRetries,
 					baseDelayMs: 1,
-					provider: { waitForUsage: { enabled: false } },
+					provider: { waitForUsage },
 				},
-			},
-		});
-		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), quotaFailure(), quotaFailure()]);
+			});
+			harness.setResponses(Array.from({ length: failures }, () => quotaFailure()));
 
-		await harness.session.prompt("test");
+			await harness.session.prompt("test");
 
-		expect(harness.session.model?.id).toBe("faux-1");
-		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
-		expect(retryEnd?.success).toBe(false);
-		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
-	});
-
-	it("restores the primary model when the bounded wait aborts on the backup model", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: {
-					enabled: true,
-					maxRetries: 3,
-					baseDelayMs: 1,
-					provider: { waitForUsage: { baseDelayMs: 1, maxDelayMs: 2, maxAttempts: 2, maxWaitMs: 10_000 } },
-				},
-			},
-		});
-		harnesses.push(harness);
-		harness.setResponses([quotaFailure(), quotaFailure(), quotaFailure(), quotaFailure()]);
-
-		await harness.session.prompt("test");
-
-		expect(harness.session.model?.id).toBe("faux-1");
-		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
-		expect(retryEnd?.success).toBe(false);
-		expect(retryEnd?.finalError).toContain("maxAttempts");
-		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
-	});
+			expect(harness.session.model?.id).toBe("faux-1");
+			const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
+			expect(retryEnd?.success).toBe(false);
+			if (waitEnabled) expect(retryEnd?.finalError).toContain("maxAttempts");
+			expect(retryEnd?.restoredModel).toBe("faux/faux-1");
+			expect(harness.faux.state.callCount).toBe(failures);
+			expect(harness.session.isRetrying).toBe(false);
+		},
+	);
 
 	it("restores the saved service tier after a backup retry, not the backup-clamped one", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
+		const harness = await backupHarness();
 		const clampSpy = vi.spyOn(
 			harness.session as unknown as { _clampServiceTierForModel: (serviceTier?: string) => void },
 			"_clampServiceTierForModel",
@@ -1414,14 +1535,7 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("restores the primary model when the scheduled backup retry continue cannot run", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
+		const harness = await backupHarness();
 		harness.setResponses([quotaFailure()]);
 		vi.spyOn(harness.session.agent, "continue").mockRejectedValueOnce(
 			new AgentContinueError("nothing-to-continue", "Nothing to continue"),
@@ -1437,14 +1551,7 @@ describe("AgentSession retry and event characterization", () => {
 	});
 
 	it("does not re-issue a wait retry cancelled between the delay and the scheduled continue", async () => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1" }, { id: "faux-backup" }],
-			settings: {
-				providerBackupModel: "faux/faux-backup",
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
-			},
-		});
-		harnesses.push(harness);
+		const harness = await backupHarness();
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 		const backupModel = harness.getModel("faux-backup");
 		const primaryModel = harness.models[0];
@@ -1513,35 +1620,5 @@ describe("AgentSession retry and event characterization", () => {
 		const retryEnd = harness.eventsOfType("auto_retry_end").at(-1);
 		expect(retryEnd?.finalError).toBe("Retry cancelled");
 		expect(retryEnd?.restoredModel).toBe("faux/faux-1");
-	});
-});
-
-describe("AgentSession retry regressions", () => {
-	const harnesses: Harness[] = [];
-
-	afterEach(() => {
-		while (harnesses.length > 0) {
-			harnesses.pop()?.cleanup();
-		}
-	});
-
-	it('#3317: retries transient "Network connection lost." failures', async () => {
-		const harness = await createHarness({
-			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
-		});
-		harnesses.push(harness);
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "Network connection lost." }),
-			fauxAssistantMessage("recovered after reconnect"),
-		]);
-
-		await harness.session.prompt("test");
-
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(harness.eventsOfType("auto_retry_start").map((event) => event.errorMessage)).toEqual([
-			"Network connection lost.",
-		]);
-		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
-		expect(getAssistantTexts(harness)).toContain("recovered after reconnect");
 	});
 });
