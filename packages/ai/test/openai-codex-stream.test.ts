@@ -5,6 +5,7 @@ import type { ResponseStreamEvent } from "openai/resources/responses/responses.j
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clampServiceTier, supportsFastMode } from "../src/models.js";
 import {
+	closeOpenAICodexWebSocketSessions,
 	getOpenAICodexWebSocketDebugStats,
 	resetOpenAICodexWebSocketDebugStats,
 	streamOpenAICodexResponses,
@@ -25,6 +26,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	closeOpenAICodexWebSocketSessions();
 	global.fetch = originalFetch;
 	globalThis.WebSocket = originalWebSocket;
 	if (originalAgentDir === undefined) {
@@ -578,57 +580,76 @@ describe("openai-codex streaming", () => {
 		const streamResult = streamOpenAICodexResponses(model, context, { apiKey: token });
 		await streamResult.result();
 	});
-	it.each(["auto", "websocket-cached", "sse"] as const)(
-		"reproduces a silent reasoning stream staying pending until cancelled (%s)",
-		async (transport) => {
+	it.each([
+		{ transport: "auto", timeoutMs: undefined, ending: "timeout" },
+		{ transport: "websocket-cached", timeoutMs: 1000, ending: "timeout" },
+		{ transport: "websocket", timeoutMs: 1000, ending: "timeout" },
+		{ transport: "sse", timeoutMs: 1000, ending: "timeout" },
+		{ transport: "sse", timeoutMs: undefined, ending: "timeout" },
+		{ transport: "auto", timeoutMs: 1000, ending: "complete" },
+		{ transport: "sse", timeoutMs: 1000, ending: "complete" },
+		{ transport: "auto", timeoutMs: 1000, ending: "abort" },
+		{ transport: "sse", timeoutMs: 1000, ending: "abort" },
+	] as const)(
+		"bounds silent reasoning, resets on progress, and cleans up: $transport $timeoutMs $ending",
+		async ({ transport, timeoutMs, ending }) => {
 			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
 			const controller = new AbortController();
+			const idleMs = timeoutMs ?? 5 * 60 * 1000;
+			const startedAt = Date.now();
 			const reasoningEvents = [
 				{ type: "response.created", response: { id: "resp_stalled" } },
-				{
-					type: "response.output_item.added",
-					output_index: 0,
-					item: { type: "reasoning", id: "rs_stalled", summary: [] },
-				},
-				{
-					type: "response.reasoning_summary_part.added",
-					output_index: 0,
-					part: { type: "summary_text", text: "" },
-				},
-				{ type: "response.reasoning_summary_text.delta", output_index: 0, delta: "Checking evidence." },
+				{ type: "response.output_item.added", item: { type: "reasoning", id: "rs_stalled", summary: [] } },
+				{ type: "response.reasoning_summary_part.added", part: { type: "summary_text", text: "" } },
+				{ type: "response.reasoning_summary_text.delta", delta: "Checking evidence." },
 			];
-			let removeAbortListener: (() => void) | undefined;
+			let emit!: (events: unknown[]) => void;
+			let closed!: () => boolean;
 			let consume: Promise<void> | undefined;
 			try {
 				if (transport === "sse") {
-					global.fetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
-						const body = new ReadableStream<Uint8Array>({
-							start(bodyController) {
-								const abort = () => bodyController.error(new DOMException("Aborted", "AbortError"));
-								init?.signal?.addEventListener("abort", abort, { once: true });
-								removeAbortListener = () => init?.signal?.removeEventListener("abort", abort);
-								const frames = reasoningEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-								bodyController.enqueue(new TextEncoder().encode(frames));
-							},
-						});
-						return new Response(body, { headers: { "content-type": "text/event-stream" } });
-					}) as typeof fetch;
+					let cancelled = false;
+					const body = new ReadableStream<Uint8Array>({
+						start(bodyController) {
+							emit = (events) =>
+								bodyController.enqueue(
+									new TextEncoder().encode(
+										events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+									),
+								);
+							emit(reasoningEvents);
+						},
+						cancel() {
+							cancelled = true;
+							// Even cleanup that never resolves must not trap the provider result.
+							return new Promise<void>(() => {});
+						},
+					});
+					closed = () => cancelled;
+					global.fetch = vi.fn(async () => new Response(body));
 				} else {
-					installScriptedCodexWebSocket([(socket) => socket.emit(reasoningEvents)]);
+					installScriptedCodexWebSocket([
+						(socket) => {
+							emit = socket.emit;
+							closed = socket.isClosed;
+							emit(reasoningEvents);
+						},
+					]);
 				}
-				const stream = streamOpenAICodexResponses(
+				const stream = streamSimpleOpenAICodexResponses(
 					codexTestModel(),
-					{ messages: [{ role: "user", content: "Explain the issue", timestamp: 1 }] },
+					{ messages: [{ role: "user", content: "Explain", timestamp: 1 }] },
 					{
 						apiKey: mockToken(),
-						sessionId: `silent-reasoning-${transport}`,
+						sessionId: `silent-${transport}`,
 						transport,
+						timeoutMs,
 						signal: controller.signal,
 					},
 				);
 				const events: AssistantMessageEvent[] = [];
 				let signalThinking!: () => void;
-				const thinking = new Promise<void>((resolve) => {
+				let thinking = new Promise<void>((resolve) => {
 					signalThinking = resolve;
 				});
 				let settled = false;
@@ -644,27 +665,126 @@ describe("openai-codex streaming", () => {
 				})();
 				await Promise.race([thinking, consume]);
 				expect(events.some((event) => event.type === "thinking_delta")).toBe(true);
-
-				// Simulate ten minutes of silence without waiting in real time.
-				await vi.advanceTimersByTimeAsync(600_000);
+				await vi.advanceTimersByTimeAsync(idleMs / 2);
 				expect(settled).toBe(false);
-				expect(events.some((event) => event.type === "done" || event.type === "error")).toBe(false);
+				thinking = new Promise<void>((resolve) => {
+					signalThinking = resolve;
+				});
+				emit([{ type: "response.reasoning_summary_text.delta", delta: " Still checking." }]);
+				await Promise.race([thinking, consume]);
+				await vi.advanceTimersByTimeAsync(idleMs / 2 + 1);
+				expect(settled).toBe(false); // The original deadline passed; progress extended it.
 
-				controller.abort();
-				const aborted = await result;
+				if (ending === "timeout") {
+					emit([{ type: "responsesapi.websocket_timing", elapsed_ms: 1 }]);
+					await vi.advanceTimersByTimeAsync(idleMs / 2);
+					expect(settled).toBe(true);
+				} else if (ending === "abort") {
+					controller.abort();
+				} else {
+					emit([{ type: "response.completed", response: { status: "completed" } }]);
+				}
+				const message = await result;
 				await consume;
-				expect(aborted.stopReason).toBe("aborted");
-				expect(aborted.content).toEqual([{ type: "thinking", thinking: "Checking evidence." }]);
-				expect(events.at(-1)?.type).toBe("error");
+				expect(message.stopReason).toBe(ending === "timeout" ? "error" : ending === "abort" ? "aborted" : "stop");
+				expect(message.content).toEqual([{ type: "thinking", thinking: "Checking evidence. Still checking." }]);
+				expect(events.filter((event) => event.type === "error" || event.type === "done")).toHaveLength(1);
+				if (ending === "timeout") {
+					expect(message.diagnostics).toContainEqual(
+						expect.objectContaining({
+							type: "provider_stream_timeout",
+							error: expect.objectContaining({ name: "CodexStreamTimeoutError" }),
+							details: expect.objectContaining({
+								transport: transport === "sse" ? "sse" : "websocket",
+								timeoutMs: idleMs,
+								responseId: "resp_stalled",
+								lastEventAt: startedAt + idleMs / 2,
+								lastContentAt: startedAt + idleMs / 2,
+							}),
+						}),
+					);
+					if (transport !== "sse") expect(global.fetch).not.toHaveBeenCalled();
+				}
+				if (ending !== "complete" || transport === "sse") expect(closed()).toBe(true);
+				closeOpenAICodexWebSocketSessions();
+				expect(vi.getTimerCount()).toBe(0);
 			} finally {
 				controller.abort();
-				try {
-					await consume;
-				} finally {
-					removeAbortListener?.();
-					resetOpenAICodexWebSocketDebugStats();
-					vi.useRealTimers();
-				}
+				await consume;
+				closeOpenAICodexWebSocketSessions();
+				vi.useRealTimers();
+			}
+		},
+	);
+
+	it.each(["websocket handshake", "websocket response", "sse headers", "sse body"])(
+		"bounds a stalled %s before output starts",
+		async (phase) => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+			const controller = new AbortController();
+			let signalReady!: () => void;
+			const ready = new Promise<void>((resolve) => {
+				signalReady = resolve;
+			});
+			let socketClosed = false;
+			if (phase === "websocket handshake") {
+				globalThis.WebSocket = class extends EventTarget {
+					constructor() {
+						super();
+						signalReady();
+					}
+					close() {
+						socketClosed = true;
+					}
+					send() {
+						throw new Error("Handshake never completed");
+					}
+				} as unknown as typeof WebSocket;
+			} else if (phase === "websocket response") {
+				installScriptedCodexWebSocket([
+					(socket) => {
+						socket.emit([{ type: "response.created", response: { id: "resp_abandoned" } }]);
+						signalReady();
+					},
+				]);
+			}
+			global.fetch = vi.fn(async () => {
+				signalReady();
+				if (phase === "sse headers") return new Promise<Response>(() => {});
+				if (phase === "sse body") return new Response(new ReadableStream());
+				return new Response(buildSSEPayload({ status: "completed" }));
+			});
+			const stream = streamOpenAICodexResponses(
+				codexTestModel(),
+				{ messages: [] },
+				{
+					apiKey: mockToken(),
+					timeoutMs: 1000,
+					transport: phase.startsWith("sse") ? "sse" : "auto",
+					signal: controller.signal,
+				},
+			);
+			let settled = false;
+			const result = stream.result().then((message) => {
+				settled = true;
+				return message;
+			});
+			try {
+				await ready;
+				await vi.advanceTimersByTimeAsync(1000);
+				expect(settled).toBe(true);
+				const message = await result;
+				expect(message.stopReason).toBe(phase.startsWith("sse") ? "error" : "stop");
+				expect(message.responseId).toBeUndefined(); // An abandoned socket cannot anchor the SSE response.
+				expect(message.diagnostics).toContainEqual(expect.objectContaining({ type: "provider_stream_timeout" }));
+				if (phase.startsWith("websocket"))
+					expect(message.content).toEqual([expect.objectContaining({ type: "text", text: "Hello" })]);
+				if (phase === "websocket handshake") expect(socketClosed).toBe(true);
+				expect(vi.getTimerCount()).toBe(0);
+			} finally {
+				controller.abort();
+				await result;
+				vi.useRealTimers();
 			}
 		},
 	);
@@ -1270,6 +1390,7 @@ describe("openai-codex streaming", () => {
 
 	/** Handle the send scripts use to drive a mocked websocket connection. */
 	interface ScriptedWebSocketHandle {
+		isClosed: () => boolean;
 		emit: (events: unknown[]) => void;
 		/** Simulate the server dropping the connection between turns. */
 		drop: () => void;
@@ -1313,6 +1434,7 @@ describe("openai-codex streaming", () => {
 				if (!script) throw new Error("unexpected websocket request");
 				queueMicrotask(() =>
 					script({
+						isClosed: () => this.readyState === 3,
 						emit: (events: unknown[]) => this.emit(events),
 						drop: () => {
 							this.readyState = 3;

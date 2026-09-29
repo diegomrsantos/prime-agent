@@ -1,0 +1,1 @@
+- Fixed Codex requests that waited indefinitely on silent WebSocket or SSE streams by adding a configurable five minute inactivity limit, transport cleanup, and timeout diagnostics for existing retry handling.
