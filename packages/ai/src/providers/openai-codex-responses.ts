@@ -48,6 +48,7 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -59,6 +60,15 @@ const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 ]);
 
 export interface OpenAICodexResponsesOptions extends StreamOptions {
+	/**
+	 * Maximum wait for a provider event, including connection setup, in milliseconds.
+	 * Defaults to 5 minutes. Increase for workloads with longer silent reasoning pauses. Positive finite values
+	 * up to 2^31 - 1 override the default; other values use the default.
+	 * Response events reset the limit; transport keepalives and vendor telemetry do not.
+	 * Applies to each transport attempt, rather than the total turn or retry duration.
+	 * Prime Agent forwards retry.provider.timeoutMs to this option.
+	 */
+	timeoutMs?: number;
 	reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
@@ -148,6 +158,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				// failure takes the shared error handling below.
 				let chainResetRetried = false;
 				for (;;) {
+					const watchdog = new CodexStreamWatchdog("websocket", output, options);
 					try {
 						await processWebSocketStream(
 							resolveCodexWebSocketUrl(model.baseUrl),
@@ -156,6 +167,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							output,
 							stream,
 							model,
+							watchdog,
 							() => {
 								websocketStarted = true;
 							},
@@ -200,8 +212,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						if (websocketStarted) {
 							throw error;
 						}
+						delete output.responseId;
 						recordWebSocketSseFallback(options?.sessionId);
 						break;
+					} finally {
+						watchdog.dispose();
 					}
 				}
 			}
@@ -210,35 +225,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				throw new Error("Request was aborted");
 			}
 
-			let response: Response;
-			try {
-				response = await fetch(resolveCodexUrl(model.baseUrl), {
-					method: "POST",
-					headers: sseHeaders,
-					body: bodyJson,
-					signal: options?.signal,
-				});
-			} catch (error) {
-				if (
-					options?.signal?.aborted ||
-					(error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted"))
-				) {
-					throw new Error("Request was aborted");
-				}
-				throw error;
-			}
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-
-			if (!response.ok) {
-				throw await parseErrorResponse(response);
-			}
-
-			if (!response.body) {
-				throw new Error("No response body");
-			}
-
-			stream.push({ type: "start", partial: output });
-			await processStream(response, output, stream, model, options);
+			await processSSEStream(bodyJson, sseHeaders, output, stream, model, options);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -357,18 +344,142 @@ function resolveCodexWebSocketUrl(baseUrl?: string): string {
 	return url.toString();
 }
 
-async function processStream(
-	response: Response,
+class CodexStreamTimeoutError extends Error {
+	readonly code = "ETIMEDOUT";
+
+	constructor(transport: string, timeoutMs: number) {
+		super(`Codex ${transport} stream timed out after ${timeoutMs}ms without a provider event`);
+		this.name = "CodexStreamTimeoutError";
+	}
+}
+
+/** Bounds silence, not the total duration of a response that keeps producing events. */
+class CodexStreamWatchdog {
+	private readonly controller = new AbortController();
+	readonly signal = this.controller.signal;
+	private timer?: ReturnType<typeof setTimeout>;
+	private disposed = false;
+	private readonly timeoutMs: number;
+	private readonly startedAt = Date.now();
+	private lastEventAt?: number;
+	private lastContentAt?: number;
+	private lastEventType?: string;
+	private readonly onAbort = () => {
+		if (this.timer) clearTimeout(this.timer);
+		this.controller.abort(new Error("Request was aborted"));
+	};
+
+	constructor(
+		private readonly transport: "websocket" | "sse",
+		private readonly output: AssistantMessage,
+		private readonly options?: OpenAICodexResponsesOptions,
+	) {
+		const configured = options?.timeoutMs;
+		this.timeoutMs =
+			configured !== undefined && Number.isFinite(configured) && configured > 0 && configured <= 2 ** 31 - 1
+				? configured
+				: DEFAULT_CODEX_IDLE_TIMEOUT_MS;
+		options?.signal?.addEventListener("abort", this.onAbort, { once: true });
+		if (options?.signal?.aborted) this.onAbort();
+		this.arm();
+	}
+
+	observe(event: Record<string, unknown>): void {
+		if (this.disposed || this.signal.aborted || typeof event.type !== "string") return;
+		// Transport keepalives and vendor telemetry do not establish response progress.
+		if (!event.type.startsWith("response.")) return;
+		this.lastEventAt = Date.now();
+		this.lastEventType = event.type;
+		if (typeof event.delta === "string" && event.delta.length > 0) this.lastContentAt = this.lastEventAt;
+		this.arm();
+	}
+
+	private arm(): void {
+		if (this.timer) clearTimeout(this.timer);
+		if (this.disposed || this.signal.aborted) return;
+		this.timer = setTimeout(() => {
+			const error = new CodexStreamTimeoutError(this.transport, this.timeoutMs);
+			appendAssistantMessageDiagnostic(
+				this.output,
+				createAssistantMessageDiagnostic("provider_stream_timeout", error, {
+					transport: this.transport,
+					timeoutMs: this.timeoutMs,
+					startedAt: this.startedAt,
+					lastEventAt: this.lastEventAt,
+					lastContentAt: this.lastContentAt,
+					lastEventType: this.lastEventType,
+					responseId: this.output.responseId,
+				}),
+			);
+			this.controller.abort(error);
+		}, this.timeoutMs);
+	}
+
+	/** Also settles reads whose underlying transport does not honor cancellation. */
+	wait<T>(operation: Promise<T>): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const onAbort = () => {
+				this.signal.removeEventListener("abort", onAbort);
+				reject(this.signal.reason);
+			};
+			this.signal.addEventListener("abort", onAbort, { once: true });
+			if (this.signal.aborted) onAbort();
+			operation.then(
+				(value) => {
+					this.signal.removeEventListener("abort", onAbort);
+					resolve(value);
+				},
+				(error) => {
+					this.signal.removeEventListener("abort", onAbort);
+					reject(this.signal.aborted ? this.signal.reason : error);
+				},
+			);
+		});
+	}
+
+	dispose(): void {
+		this.disposed = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.options?.signal?.removeEventListener("abort", this.onAbort);
+		// Release HTTP bodies even when a response hook or error parser failed before streaming.
+		this.controller.abort(new Error("Codex request ended"));
+	}
+}
+
+async function processSSEStream(
+	body: string,
+	headers: Headers,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response)), output, stream, model, {
-		serviceTier: options?.serviceTier,
-		resolveServiceTier: resolveCodexServiceTier,
-		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model.id),
-	});
+	const watchdog = new CodexStreamWatchdog("sse", output, options);
+	try {
+		const response = await watchdog.wait(
+			fetch(resolveCodexUrl(model.baseUrl), {
+				method: "POST",
+				headers,
+				body,
+				signal: watchdog.signal,
+			}),
+		);
+		await watchdog.wait(
+			Promise.resolve(
+				options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model),
+			),
+		);
+		if (!response.ok) throw await watchdog.wait(parseErrorResponse(response));
+		if (!response.body) throw new Error("No response body");
+		stream.push({ type: "start", partial: output });
+		await processResponsesStream(mapCodexEvents(parseSSE(response, watchdog)), output, stream, model, {
+			serviceTier: options?.serviceTier,
+			resolveServiceTier: resolveCodexServiceTier,
+			applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model.id),
+		});
+	} finally {
+		watchdog.dispose();
+	}
 }
 
 class CodexApiError extends Error {
@@ -473,7 +584,7 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 	return CODEX_RESPONSE_STATUSES.has(status as CodexResponseStatus) ? (status as CodexResponseStatus) : undefined;
 }
 
-async function* parseSSE(response: Response): AsyncGenerator<Record<string, unknown>> {
+async function* parseSSE(response: Response, watchdog: CodexStreamWatchdog): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
 	const reader = response.body.getReader();
@@ -482,7 +593,7 @@ async function* parseSSE(response: Response): AsyncGenerator<Record<string, unkn
 
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			const { done, value } = await watchdog.wait(reader.read());
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
 
@@ -499,7 +610,9 @@ async function* parseSSE(response: Response): AsyncGenerator<Record<string, unkn
 					const data = dataLines.join("\n").trim();
 					if (data && data !== "[DONE]") {
 						try {
-							yield JSON.parse(data) as Record<string, unknown>;
+							const event = JSON.parse(data) as Record<string, unknown>;
+							watchdog.observe(event);
+							yield event;
 						} catch (cause) {
 							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
 								cause,
@@ -513,7 +626,8 @@ async function* parseSSE(response: Response): AsyncGenerator<Record<string, unkn
 		}
 	} finally {
 		try {
-			await reader.cancel();
+			// Cancellation can itself stay pending on a broken transport.
+			void reader.cancel().catch(() => {});
 		} catch {
 			// The reader may already be closed.
 		}
@@ -705,6 +819,7 @@ function scheduleSessionWebSocketExpiry(sessionId: string, entry: CachedWebSocke
 }
 
 async function connectWebSocket(url: string, headers: Headers, signal?: AbortSignal): Promise<WebSocketLike> {
+	if (signal?.aborted) throw signal.reason;
 	const WebSocketCtor = getWebSocketConstructor();
 	if (!WebSocketCtor) {
 		throw new Error("WebSocket transport is not available in this runtime");
@@ -748,8 +863,8 @@ async function connectWebSocket(url: string, headers: Headers, signal?: AbortSig
 			if (settled) return;
 			settled = true;
 			cleanup();
-			socket.close(1000, "aborted");
-			reject(new Error("Request was aborted"));
+			closeWebSocketSilently(socket, 1000, "aborted");
+			reject(signal?.reason ?? new Error("Request was aborted"));
 		};
 
 		const cleanup = () => {
@@ -910,7 +1025,11 @@ async function decodeWebSocketData(data: unknown): Promise<string | null> {
 	return null;
 }
 
-async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+async function* parseWebSocket(
+	socket: WebSocketLike,
+	watchdog: CodexStreamWatchdog,
+): AsyncGenerator<Record<string, unknown>> {
+	const signal = watchdog.signal;
 	const queue: Record<string, unknown>[] = [];
 	let pending: (() => void) | null = null;
 	let done = false;
@@ -932,6 +1051,8 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 				text = await decodeWebSocketData((event as { data?: unknown }).data);
 				if (!text) return;
 				const parsed = JSON.parse(text) as Record<string, unknown>;
+				if (signal.aborted) return;
+				watchdog.observe(parsed);
 				const type = typeof parsed.type === "string" ? parsed.type : "";
 				if (type === "response.completed" || type === "response.done" || type === "response.incomplete") {
 					sawCompletion = true;
@@ -970,7 +1091,7 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 	};
 
 	const onAbort = () => {
-		failed = new Error("Request was aborted");
+		failed = signal.reason;
 		done = true;
 		wake();
 	};
@@ -983,7 +1104,7 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 	try {
 		while (true) {
 			if (signal?.aborted) {
-				throw new Error("Request was aborted");
+				throw signal.reason;
 			}
 			if (queue.length > 0) {
 				yield queue.shift()!;
@@ -1109,10 +1230,11 @@ async function processWebSocketStream(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
+	watchdog: CodexStreamWatchdog,
 	onStart: () => void,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	const { socket, entry, reused, release } = await acquireWebSocket(url, headers, options?.sessionId, options?.signal);
+	const { socket, entry, reused, release } = await acquireWebSocket(url, headers, options?.sessionId, watchdog.signal);
 	let keepConnection = true;
 	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
@@ -1138,10 +1260,11 @@ async function processWebSocketStream(
 		}
 	}
 	try {
+		if (watchdog.signal.aborted) throw watchdog.signal.reason;
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstVisibleEvent(
-				mapCodexEvents(parseWebSocket(socket, options?.signal)),
+				mapCodexEvents(parseWebSocket(socket, watchdog)),
 				output,
 				stream,
 				onStart,
